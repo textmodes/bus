@@ -2,11 +2,16 @@ package bus
 
 import (
 	"fmt"
+	"log"
 	"reflect"
+	"runtime"
 	"sync"
 )
 
+var shared = New()
+
 type Bus struct {
+	Debug      bool
 	subscriber map[string][]*subscriber
 	lock       sync.Mutex
 	wg         sync.WaitGroup
@@ -22,6 +27,7 @@ type subscriber struct {
 
 func New() *Bus {
 	return &Bus{
+		false,
 		make(map[string][]*subscriber),
 		sync.Mutex{},
 		sync.WaitGroup{},
@@ -53,6 +59,9 @@ func (b *Bus) Subscribe(n string, fn interface{}) (err error) {
 	s, err = b.prepare(n, fn, false, false, false)
 	if err == nil {
 		b.subscriber[n] = append(b.subscriber[n], s)
+		if b.Debug {
+			log.Printf("bus [%p]: subsribed to %q\n", b, n)
+		}
 	}
 	return
 }
@@ -70,7 +79,7 @@ func (b *Bus) SubscribeAsync(n string, fn interface{}, transaction bool) (err er
 	return
 }
 
-// OnceAsync removes the event after the callback has been fired synchronously.
+// Once removes the event after the callback has been fired synchronously.
 func (b *Bus) Once(n string, fn interface{}) (err error) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
@@ -97,11 +106,19 @@ func (b *Bus) OnceAsync(n string, fn interface{}) (err error) {
 }
 
 // Unsubscribe removes a topic from the bus
-func (b *Bus) Unsubscribe(n string) error {
+func (b *Bus) Unsubscribe(n string, fn interface{}) error {
+	if reflect.TypeOf(fn).Kind() != reflect.Func {
+		return fmt.Errorf("%T is not a function", fn)
+	}
 	b.lock.Lock()
 	defer b.lock.Unlock()
-	if _, ok := b.subscriber[n]; ok {
-		delete(b.subscriber, n)
+	if h, ok := b.subscriber[n]; ok {
+		for i, s := range h {
+			if s == fn {
+				b.subscriber[n] = append(b.subscriber[n][i:], b.subscriber[n][i+1:]...)
+				return nil
+			}
+		}
 		return nil
 	}
 	return fmt.Errorf("Topic %q does not exist", n)
@@ -109,6 +126,9 @@ func (b *Bus) Unsubscribe(n string) error {
 
 func (b *Bus) Publish(n string, a ...interface{}) {
 	b.lock.Lock()
+	if b.Debug && len(b.subscriber[n]) > 0 {
+		log.Printf("bus [%p]: publish %q to %d subscribers\n", b, n, len(b.subscriber[n]))
+	}
 	if h, ok := b.subscriber[n]; ok {
 		for _, s := range h {
 			if s.async {
@@ -118,13 +138,21 @@ func (b *Bus) Publish(n string, a ...interface{}) {
 				b.publish(s, n, a...)
 			}
 		}
-	} else {
-		b.lock.Unlock()
 	}
+	b.lock.Unlock()
 }
 
 func (b *Bus) publish(h *subscriber, n string, a ...interface{}) {
 	args := b.setup(h.once, n, a...)
+	defer func() {
+		if err := recover(); err != nil {
+			trace := make([]byte, 1024)
+			runtime.Stack(trace, false)
+			log.Printf("bus: recover in %T: %v", h.cb.Type().Name(), err)
+			log.Println(string(trace))
+			//fmt.Println(errors.Wrap(err, 2).ErrorStack())
+		}
+	}()
 	h.cb.Call(args)
 }
 
@@ -138,7 +166,6 @@ func (b *Bus) publishAsync(h *subscriber, n string, a ...interface{}) {
 }
 
 func (b *Bus) setup(r bool, n string, a ...interface{}) []reflect.Value {
-	defer b.lock.Unlock()
 	args := make([]reflect.Value, 0)
 	for _, arg := range a {
 		args = append(args, reflect.ValueOf(arg))
@@ -152,4 +179,39 @@ func (b *Bus) setup(r bool, n string, a ...interface{}) []reflect.Value {
 // Wait waits for all the async callbacks to finish
 func (b *Bus) Wait() {
 	b.wg.Wait()
+}
+
+// Global functions for the shared bus
+
+func Debug(debug bool) {
+	shared.Debug = debug
+}
+
+func Publish(n string, a ...interface{}) {
+	shared.Publish(n, a...)
+}
+
+// Subscribe adds a callback to the subscribers.
+func Subscribe(n string, fn interface{}) error {
+	return shared.Subscribe(n, fn)
+}
+
+// SubscribeAsync adds a callback to the subscribers. Transaction determines if the subsequent calls for a topic are done in concurrently (true) or serial (false).
+func SubscribeAsync(n string, fn interface{}, transaction bool) (err error) {
+	return shared.SubscribeAsync(n, fn, transaction)
+}
+
+// Once removes the event after the callback has been fired synchronously.
+func Once(n string, fn interface{}) (err error) {
+	return shared.Once(n, fn)
+}
+
+// OnceAsync removes the event after the callback has been fired asynchronously.
+func OnceAsync(n string, fn interface{}) (err error) {
+	return shared.OnceAsync(n, fn)
+}
+
+// Unsubscribe removes a topic from the bus
+func Unsubscribe(n string, fn interface{}) error {
+	return shared.Unsubscribe(n, fn)
 }
